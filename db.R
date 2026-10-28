@@ -38,7 +38,7 @@ make_pool <- function() {
 # 2. Query helper
 # ============================================================
 
-query <- function(p, sql, params = NULL) {
+db_query <- function(p, sql, params = NULL) {
   
   con <- pool::poolCheckout(p)
   
@@ -122,7 +122,6 @@ init_db <- function(p) {
     study_groups = c('group_id','study_id','group_name','group_type','group_order'),
     measurements = c('measurement_id','outcome','measurement_tool','domain','self_reported','validated','validation_url','study_ids','created_at'),
     results = c('result_id','study_id','predictor_measurement_id','outcome_measurement_id','df','beta','r','unstandardized_coefficient','p_value','effect_size','effect_size_type','created_at'),
-    result_groups = c('result_group_id','result_id','group_id','mean','sd','n'),
     result_measurement_groups = c('result_measurement_group_id','result_id','measurement_id','group_id','mean','sd','n'),
     correlations = c('correlation_id','study_id','variable_1','variable_2','correlation','created_at'),
     qualitative = c('qualitative_id','study_id','theme','theme_description','created_at')
@@ -198,7 +197,6 @@ fetch_all <- function(p, table) {
     "study_groups",
     "measurements",
     "results",
-    "result_groups",
     "result_measurement_groups",
     "correlations",
     "qualitative"

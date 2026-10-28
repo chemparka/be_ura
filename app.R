@@ -134,8 +134,7 @@ server <- function(input,output,session) {
         removed <- old$group_id[seq.int(n+1,nrow(old))]
         for(gid in removed) {
           linked <- query_con(con,'SELECT 1 FROM result_measurement_groups WHERE group_id=$1 LIMIT 1',list(as.character(gid)))
-          legacy <- query_con(con,'SELECT 1 FROM result_groups WHERE group_id=$1 LIMIT 1',list(as.character(gid)))
-          if(nrow(linked) || nrow(legacy)) stop('Cannot remove a group with saved result statistics.')
+          if(nrow(linked)) stop('Cannot remove a group with saved result statistics.')
         }
         exec_con(con,'DELETE FROM study_groups WHERE study_id=$1 AND group_order>$2',list(id,as.integer(n)))
       }
@@ -175,7 +174,7 @@ server <- function(input,output,session) {
     id <- parse_id(input$edit_measurement)
     values <- list(input$outcome,input$tool,input$domain,input$self_report,input$validated,input$validation_url,json)
     if(is.null(id)) {
-      id <- as.character(query(p,paste0('INSERT INTO measurements(outcome,measurement_tool,domain,self_reported,validated,validation_url,study_ids) ',
+      id <- as.character(db_query(p,paste0('INSERT INTO measurements(outcome,measurement_tool,domain,self_reported,validated,validation_url,study_ids) ',
                                         'VALUES($1,$2,$3,$4,$5,$6,$7::jsonb) RETURNING measurement_id'),values)$measurement_id[1])
     } else {
       exec(p,paste0('UPDATE measurements SET outcome=$1,measurement_tool=$2,domain=$3,self_reported=$4,validated=$5,',
