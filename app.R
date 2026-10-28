@@ -4,6 +4,7 @@ library(DBI)
 library(jsonlite)
 library(pool)
 source('db.R')
+source('auth.R')
 
 p <- make_pool()
 tryCatch(init_db(p), error = function(e) { pool::poolClose(p); stop(e) })
@@ -11,7 +12,15 @@ onStop(function() pool::poolClose(p))
 
 TABLES <- c('studies','study_groups','measurements','results','result_measurement_groups','correlations','qualitative')
 ui <- fluidPage(
+  uiOutput("authenticated_ui")
+)
+
+extraction_ui <- fluidPage(
   titlePanel('Systematic review | Neon PostgreSQL extraction'),
+  fluidRow(
+    column(9, textOutput('current_reviewer')),
+    column(3, actionButton('logout', 'Log out'))
+  ),
   p('Database-generated numeric IDs; dynamic group statistics; correlation pairs.'),
   tabsetPanel(
     tabPanel('1. Studies',
@@ -76,14 +85,147 @@ ui <- fluidPage(
   )
 )
 
+login_ui <- fluidPage(
+  titlePanel("URA-BE-FIT Data Extraction"),
+  tabsetPanel(
+    tabPanel("Login",
+      textInput("login_username", "Username"),
+      passwordInput("login_password", "Password"),
+      actionButton("login", "Log in")
+    ),
+    tabPanel("Register",
+      textInput("register_username", "Choose username"),
+      passwordInput("register_password", "Choose password"),
+      passwordInput("register_confirm", "Confirm password"),
+      actionButton("register", "Create account"),
+      p("Accounts require administrator approval before access.")
+    )
+  )
+)
+
 server <- function(input,output,session) {
+  auth <- reactiveValues(logged_in = FALSE,user_id = NULL,username = NULL,role = NULL)
   fetch_tables <- function() setNames(lapply(TABLES,function(x) fetch_all(p,x)),TABLES)
-  tables <- reactiveVal(fetch_tables())
-  refresh <- function() tables(fetch_tables())
-  safe <- function(fun) tryCatch({fun();refresh();showNotification('Saved to Neon PostgreSQL',type='message')},
-                                 error=function(e) {message('Database error: ',conditionMessage(e));showNotification(conditionMessage(e),type='error',duration=12)})
-  observeEvent(input$refresh,refresh())
-  studies_choices <- reactive({s <- tables()$studies;setNames(as.character(s$study_id),paste(s$first_author,s$publication_year,s$title,sep=' | '))})
+  tables <- reactiveVal(NULL)
+  
+  require_reviewer <- function() {
+    if (!isTRUE(auth$logged_in) || is.null(auth$user_id)) {
+      stop('Login is required.')
+    }
+    reviewer <- db_query(
+      p,
+      "SELECT user_id, username, role FROM app_users WHERE user_id=$1 AND status='active'",
+      list(as.character(auth$user_id))
+    )
+    if (nrow(reviewer) != 1L) {
+      auth$logged_in <- FALSE
+      auth$user_id <- NULL
+      auth$username <- NULL
+      auth$role <- NULL
+      tables(NULL)
+      stop('Reviewer account is no longer authorized.')
+    }
+    invisible(reviewer)
+  }
+
+  refresh <- function() {
+    require_reviewer()
+    tables(fetch_tables())
+  }
+
+  observeEvent(auth$logged_in, {
+    if (isTRUE(auth$logged_in)) {
+      tryCatch(refresh(), error = function(e) {
+        message('Unable to load extraction data: ', conditionMessage(e))
+        showNotification('Unable to load extraction data.', type = 'error')
+      })
+    } else {
+      tables(NULL)
+    }
+  })
+
+  safe <- function(fun) tryCatch({
+    require_reviewer()
+    fun()
+    refresh()
+    showNotification('Saved to Neon PostgreSQL', type='message')
+  }, error=function(e) {
+    message('Save failed: ', conditionMessage(e))
+    showNotification('Operation failed. Please check with the administrator.',
+                     type='error', duration=12)
+  })
+  
+  observeEvent(input$register, {
+    if (!identical(input$register_password, input$register_confirm)) {
+      showNotification("Passwords do not match.", type = "error")
+      return()
+    }
+    tryCatch({
+      register_user(p, input$register_username, input$register_password)
+      showNotification("Account created. Await administrator approval.", duration = 10)
+      updateTextInput(session, "register_username", value = "")
+      updateTextInput(session, "register_password", value = "")
+      updateTextInput(session, "register_confirm", value = "")
+    }, error = function(e) {
+      message("Registration error: ", conditionMessage(e))
+      showNotification("Registration failed. Check username and password requirements.",
+                       type = "error", duration = 10)
+    })
+  })
+
+  login_failures <- 0L
+  login_blocked_until <- as.POSIXct(NA)
+
+  observeEvent(input$login, {
+    if (!is.na(login_blocked_until) && Sys.time() < login_blocked_until) {
+      showNotification('Too many attempts. Try again later.', type='error')
+      return()
+    }
+    user <- tryCatch(
+      authenticate_user(p, input$login_username, input$login_password),
+      error = function(e) { message('Login error: ', conditionMessage(e)); NULL }
+    )
+    if (is.null(user)) {
+      login_failures <<- login_failures + 1L
+      if (login_failures >= 5L) {
+        login_blocked_until <<- Sys.time() + 300
+        login_failures <<- 0L
+      }
+      showNotification('Invalid credentials or account not approved.', type='error')
+      return()
+    }
+    login_failures <<- 0L
+    login_blocked_until <<- as.POSIXct(NA)
+    auth$user_id <- user$user_id[1]
+    auth$username <- user$username[1]
+    auth$role <- user$role[1]
+    auth$logged_in <- TRUE
+    updateTextInput(session, 'login_username', value='')
+    updateTextInput(session, 'login_password', value='')
+  })
+
+  output$current_reviewer <- renderText({
+    req(isTRUE(auth$logged_in))
+    paste('Logged in as:', auth$username)
+  })
+
+  observeEvent(input$logout, {
+    auth$logged_in <- FALSE
+    auth$user_id <- NULL
+    auth$username <- NULL
+    auth$role <- NULL
+    tables(NULL)
+    showNotification('Logged out.', type='message')
+  })
+  output$authenticated_ui <- renderUI({
+    if (!isTRUE(auth$logged_in)) {
+      return(login_ui)
+    }
+    extraction_ui
+  })
+  
+  observeEvent(input$refresh, refresh())
+  studies_choices <- reactive({req(isTRUE(auth$logged_in), tables());s <- tables()$studies;setNames(as.character(s$study_id),paste(s$first_author,s$publication_year,s$title,sep=' | '))})
   observe({
     choices <- studies_choices()
     updateSelectInput(session,'edit_study',choices=c('Create new'='',choices),selected=isolate(input$edit_study))
@@ -122,6 +264,7 @@ server <- function(input,output,session) {
     }))
   })
   observeEvent(input$lookup,{
+    require_reviewer()
     tryCatch({x <- lookup_doi(input$doi_input);updateTextInput(session,'title',value=x$title)
     updateNumericInput(session,'year',value=x$year);updateTextInput(session,'author',value=x$first_author)
     showNotification('Metadata found. Verify before saving.')},
@@ -136,7 +279,7 @@ server <- function(input,output,session) {
     id <- parse_id(input$edit_study)
     doi <- regmatches(input$doi_input,regexpr('10\\.[0-9]{4,9}/[^[:space:]?#]+',input$doi_input,perl=TRUE))
     doi <- if(length(doi)) doi else NA_character_
-    with_transaction(p,function(con){
+    with_reviewer_transaction(p,auth$user_id,function(con) {
       values <- list(input$title,int_or_na(input$year),input$author,doi,input$doi_input,input$country,input$design,
                      int_or_na(input$total),int_or_na(input$male),int_or_na(input$female),int_or_na(input$other))
       if(is.null(id)) {
@@ -189,9 +332,7 @@ server <- function(input,output,session) {
                       choices = c('Create new' = '', opts), selected = current)
   })
 
-  observeEvent(input$new_measurement, {
-    updateSelectInput(session, 'edit_measurement', selected = '')
-    # Reset directly as well, including when Create new is already selected.
+  reset_measurement <- function() {
     for (key in c('outcome', 'tool', 'domain', 'validation_url')) {
       updateTextInput(session, key, value = '')
     }
@@ -200,19 +341,17 @@ server <- function(input,output,session) {
     }
     updateSelectizeInput(session, 'used_studies', choices = studies_choices(),
                          selected = character(), server = FALSE)
+  }
+
+  observeEvent(input$new_measurement, {
+    updateSelectInput(session, 'edit_measurement', selected = '')
+    reset_measurement()
   })
 
   observeEvent(input$edit_measurement, {
     id <- parse_id(input$edit_measurement)
     if (is.null(id)) {
-      for (key in c('outcome', 'tool', 'domain', 'validation_url')) {
-        updateTextInput(session, key, value = '')
-      }
-      for (key in c('self_report', 'validated')) {
-        updateCheckboxInput(session, key, value = FALSE)
-      }
-      updateSelectizeInput(session, 'used_studies', choices = studies_choices(),
-                           selected = character(), server = FALSE)
+      reset_measurement()
       return()
     }
 
@@ -256,17 +395,24 @@ server <- function(input,output,session) {
     json <- as.character(jsonlite::toJSON(used,auto_unbox=FALSE))
     id <- parse_id(input$edit_measurement)
     values <- list(input$outcome,input$tool,input$domain,input$self_report,input$validated,input$validation_url,json)
-    if(is.null(id)) {
-      id <- as.character(db_query(p,paste0('INSERT INTO measurements(outcome,measurement_tool,domain,self_reported,validated,validation_url,study_ids) ',
-                                        'VALUES($1,$2,$3,$4,$5,$6,$7::jsonb) RETURNING measurement_id'),values)$measurement_id[1])
-    } else {
-      exec(p,paste0('UPDATE measurements SET outcome=$1,measurement_tool=$2,domain=$3,self_reported=$4,validated=$5,',
-                    'validation_url=$6,study_ids=$7::jsonb WHERE measurement_id=$8'),c(values,list(id)))
-    }
-    updateSelectInput(session,'edit_measurement',selected=id)
+    saved_id <- with_reviewer_transaction(p, auth$user_id, function(con) {
+      if (is.null(id)) {
+        as.character(query_con(con, paste0(
+          'INSERT INTO measurements(outcome,measurement_tool,domain,self_reported,validated,validation_url,study_ids) ',
+          'VALUES($1,$2,$3,$4,$5,$6,$7::jsonb) RETURNING measurement_id'
+        ), values)$measurement_id[1])
+      } else {
+        exec_con(con, paste0(
+          'UPDATE measurements SET outcome=$1,measurement_tool=$2,domain=$3,self_reported=$4,validated=$5,',
+          'validation_url=$6,study_ids=$7::jsonb WHERE measurement_id=$8'
+        ), c(values, list(id)))
+        id
+      }
+    })
+    updateSelectInput(session,'edit_measurement',selected=saved_id)
   }))
   study_measurements <- reactive({
-    req(input$result_study)
+    req(isTRUE(auth$logged_in), tables(), input$result_study)
     m <- tables()$measurements
     keep <- vapply(seq_len(nrow(m)),function(i){
       ids <- measurement_study_ids(m$study_ids[i])
@@ -280,7 +426,7 @@ server <- function(input,output,session) {
     updateSelectInput(session,'result_outcome',choices=opts,selected=isolate(input$result_outcome))
   })
   selected_groups <- reactive({
-    req(input$result_study);g <- tables()$study_groups
+    req(isTRUE(auth$logged_in), tables(), input$result_study);g <- tables()$study_groups
     g <- g[as.character(g$study_id)==as.character(input$result_study),,drop=FALSE]
     g[order(g$group_order),,drop=FALSE]
   })
@@ -343,7 +489,7 @@ server <- function(input,output,session) {
       if (!is.na(s$sd) && s$sd < 0) stop('SD cannot be negative.')
       if (!is.na(s$n) && s$n < 0) stop('n cannot be negative.')
     }
-    with_transaction(p, function(con) {
+    with_reviewer_transaction(p,auth$user_id,function(con) {
       id <- as.character(query_con(con, paste0(
         'INSERT INTO results(study_id,predictor_measurement_id,outcome_measurement_id,df,beta,r,',
         'unstandardized_coefficient,p_value,effect_size,effect_size_type) ',
@@ -366,7 +512,7 @@ server <- function(input,output,session) {
   observeEvent(input$save_matrix,safe(function(){
     req(input$corr_study,nzchar(input$matrix));m <- parse_matrix(input$matrix)
     count <- 0L
-    with_transaction(p,function(con){
+    with_reviewer_transaction(p,auth$user_id,function(con) {
       for(i in seq_len(nrow(m))) for(k in seq_len(ncol(m))) if(k>i && !is.na(m[i,k])) {
         exec_con(con,'INSERT INTO correlations(study_id,variable_1,variable_2,correlation) VALUES($1,$2,$3,$4)',
                  list(input$corr_study,rownames(m)[i],colnames(m)[k],as.numeric(m[i,k])))
@@ -378,17 +524,33 @@ server <- function(input,output,session) {
   observeEvent(input$save_qual,safe(function(){
     req(input$qual_study)
     if(!nzchar(trimws(input$theme))) stop('Theme is required.')
-    exec(p,'INSERT INTO qualitative(study_id,theme,theme_description) VALUES($1,$2,$3)',
-         list(input$qual_study,input$theme,input$description))
+    with_reviewer_transaction(p, auth$user_id, function(con) {
+      exec_con(con,
+        'INSERT INTO qualitative(study_id,theme,theme_description) VALUES($1,$2,$3)',
+        list(input$qual_study,input$theme,input$description))
+    })
   }))
   for(nm in TABLES) local({name <- nm
-  output[[paste0(name,'_view')]] <- renderDT(DT::datatable(tables()[[name]],options=list(scrollX=TRUE,pageLength=5)))
+  output[[paste0(name,'_view')]] <- renderDT({
+    req(isTRUE(auth$logged_in), tables())
+    DT::datatable(tables()[[name]], options=list(scrollX=TRUE,pageLength=5))
+  })
   })
   output$download <- downloadHandler(
-    filename=function()paste0(input$export_table,'_',Sys.Date(),'.csv'),
-    content=function(file){d <- fetch_all(p,input$export_table)
-    d[] <- lapply(d,function(x)if(is.list(x))vapply(x,function(z)as.character(jsonlite::toJSON(z,auto_unbox=TRUE)),character(1)) else x)
-    utils::write.csv(d,file,row.names=FALSE,na='')
-    })
+    filename = function() {
+      require_reviewer()
+      paste0(input$export_table, '_', Sys.Date(), '.csv')
+    },
+    content = function(file) {
+      require_reviewer()
+      d <- fetch_all(p, input$export_table)
+      d[] <- lapply(d, function(x) {
+        if (is.list(x)) {
+          vapply(x, function(z) as.character(jsonlite::toJSON(z, auto_unbox=TRUE)), character(1))
+        } else x
+      })
+      utils::write.csv(d, file, row.names=FALSE, na='')
+    }
+  )
 }
 shinyApp(ui,server)

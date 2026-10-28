@@ -3,9 +3,6 @@ library(RPostgres)
 library(pool)
 library(jsonlite)
 
-# ============================================================
-# 1. PostgreSQL connection pool
-# ============================================================
 
 make_pool <- function() {
   
@@ -34,85 +31,27 @@ make_pool <- function() {
 }
 
 
-# ============================================================
-# 2. Query helper
-# ============================================================
-
-db_query <- function(p, sql, params = NULL) {
-  
-  con <- pool::poolCheckout(p)
-  
-  on.exit(
-    pool::poolReturn(con),
-    add = TRUE
-  )
-  
-  if (is.null(params) || length(params) == 0) {
-    
-    DBI::dbGetQuery(
-      con,
-      sql
-    )
-    
-  } else {
-    
-    DBI::dbGetQuery(
-      con,
-      sql,
-      params = params
-    )
-    
-  }
-}
-
-
-# ============================================================
-# 3. Execute SQL statements
-# ============================================================
-
-exec <- function(p, sql, params = NULL) {
-  
-  con <- pool::poolCheckout(p)
-  
-  on.exit(
-    pool::poolReturn(con),
-    add = TRUE
-  )
-  
-  if (is.null(params) || length(params) == 0) {
-    
-    DBI::dbExecute(
-      con,
-      sql
-    )
-    
-  } else {
-    
-    DBI::dbExecute(
-      con,
-      sql,
-      params = params
-    )
-    
-  }
-}
-
-
-# Execute multiple statements on the SAME checked-out connection.
-with_transaction <- function(p, fun) {
-  con <- pool::poolCheckout(p)
-  on.exit(pool::poolReturn(con), add = TRUE)
-  DBI::dbWithTransaction(con, fun(con))
-}
 
 query_con <- function(con, sql, params = NULL) {
-  if (is.null(params) || !length(params)) DBI::dbGetQuery(con, sql)
-  else DBI::dbGetQuery(con, sql, params = params)
+  if (is.null(params) || !length(params)) return(DBI::dbGetQuery(con, sql))
+  DBI::dbGetQuery(con, sql, params = params)
 }
 
 exec_con <- function(con, sql, params = NULL) {
-  if (is.null(params) || !length(params)) DBI::dbExecute(con, sql)
-  else DBI::dbExecute(con, sql, params = params)
+  if (is.null(params) || !length(params)) return(DBI::dbExecute(con, sql))
+  DBI::dbExecute(con, sql, params = params)
+}
+
+db_query <- function(p, sql, params = NULL) {
+  con <- pool::poolCheckout(p)
+  on.exit(pool::poolReturn(con), add = TRUE)
+  query_con(con, sql, params)
+}
+
+exec <- function(p, sql, params = NULL) {
+  con <- pool::poolCheckout(p)
+  on.exit(pool::poolReturn(con), add = TRUE)
+  exec_con(con, sql, params)
 }
 
 # Validate an existing Neon schema. Never modify tables on application startup.
@@ -133,6 +72,9 @@ init_db <- function(p) {
     absent <- setdiff(expected[[tbl]], DBI::dbListFields(con, tbl))
     if (length(absent)) stop('Missing columns in ', tbl, ': ', paste(absent, collapse=', '))
   }
+  for (tbl in c('app_users', 'audit_log')) {
+    if (!DBI::dbExistsTable(con, tbl)) stop('Missing authentication table: ', tbl)
+  }
   invisible(TRUE)
 }
 
@@ -144,20 +86,6 @@ parse_id <- function(x) {
   x
 }
 
-# ============================================================
-# 4. Utility functions
-# ============================================================
-
-new_id <- function(prefix) {
-  paste0(
-    prefix,
-    "_",
-    paste(
-      sample(c(letters, 0:9), 24, replace = TRUE),
-      collapse = ""
-    )
-  )
-}
 
 num_or_na <- function(x) {
   
@@ -186,9 +114,6 @@ int_or_na <- function(x) {
 }
 
 
-# ============================================================
-# 5. Fetch all records
-# ============================================================
 
 fetch_all <- function(p, table) {
   
@@ -240,9 +165,6 @@ fetch_all <- function(p, table) {
 }
 
 
-# ============================================================
-# 6. DOI lookup
-# ============================================================
 
 `%||%` <- function(x, y) {
   if (is.null(x) || length(x) == 0) y else x
@@ -290,9 +212,6 @@ lookup_doi <- function(value) {
 }
 
 
-# ============================================================
-# 7. Correlation matrix parser
-# ============================================================
 
 parse_matrix <- function(txt) {
   
@@ -351,4 +270,24 @@ parse_matrix <- function(txt) {
   }
   
   m
+}
+
+# Extraction writes must use the same connection and transaction as the audit context.
+with_reviewer_transaction <- function(p, user_id, fun) {
+  id <- as.character(user_id)
+  if (length(id) != 1L || is.na(id) || !grepl("^[0-9]+$", id)) {
+    stop("A valid authenticated reviewer ID is required.")
+  }
+
+  con <- pool::poolCheckout(p)
+  on.exit(pool::poolReturn(con), add = TRUE)
+
+  DBI::dbWithTransaction(con, {
+    reviewer <- query_con(con,
+      "SELECT user_id FROM app_users WHERE user_id = $1 AND status = 'active' FOR SHARE",
+      list(id))
+    if (nrow(reviewer) != 1L) stop("Reviewer account is not active.")
+    query_con(con, "SELECT set_config('app.user_id', $1, true) AS reviewer_id", list(id))
+    fun(con)
+  })
 }
