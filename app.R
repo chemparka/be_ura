@@ -26,7 +26,25 @@ ui <- fluidPage(
              numericInput('other','Other gender',NA,min=0),actionButton('save_study','Save study and groups'), div(style='height:50px;'), DTOutput('studies_view'),h4('Study groups'),DTOutput('study_groups_view')
     ),
     tabPanel('2. Measurements',
-             selectInput('edit_measurement','Edit existing measurement (optional)',choices=c('Create new'='')),
+             fluidRow(
+               column(
+                 9,
+                 selectInput(
+                   'edit_measurement',
+                   'Edit existing measurement (optional)',
+                   choices = c('Create new' = '')
+                 )
+               ),
+               column(
+                 3,
+                 br(),
+                 actionButton(
+                   'new_measurement',
+                   'New measurement',
+                   icon = icon('plus')
+                 )
+               )
+             ),
              textInput('outcome','Outcome / variable'),textInput('tool','Measurement instrument'),
              textInput('domain','Domain'),checkboxInput('self_report','Self-reported'),
              checkboxInput('validated','Validated'),textInput('validation_url','Validation study URL'),
@@ -71,7 +89,6 @@ server <- function(input,output,session) {
     updateSelectInput(session,'edit_study',choices=c('Create new'='',choices),selected=isolate(input$edit_study))
     for (id in c('result_study','corr_study','qual_study'))
       updateSelectInput(session,id,choices=choices,selected=isolate(input[[id]]))
-    updateSelectizeInput(session,'used_studies',choices=choices,selected=isolate(input$used_studies),server=TRUE)
   })
   # Selecting an existing study populates the edit form and preserves group names.
   group_edit <- reactiveVal(NULL)
@@ -148,23 +165,89 @@ server <- function(input,output,session) {
     }) -> saved_id
     updateSelectInput(session,'edit_study',selected=saved_id)
   }))
-  observe({
+  # Measurement selection and study associations
+  measurement_study_ids <- function(x) {
+    if (is.list(x) && length(x) == 1L) x <- x[[1L]]
+    if (is.null(x) || !length(x) || all(is.na(x))) return(character())
+    if (is.character(x) && length(x) == 1L) {
+      value <- trimws(x)
+      if (!nzchar(value) || value == 'null') return(character())
+      if (startsWith(value, '[') || startsWith(value, '"')) {
+        x <- tryCatch(jsonlite::fromJSON(value), error = function(e) character())
+      }
+    }
+    unique(as.character(unlist(x, use.names = FALSE)))
+  }
+
+  observeEvent(tables()$measurements, {
     m <- tables()$measurements
-    opts <- setNames(as.character(m$measurement_id),paste(m$outcome,m$measurement_tool,sep=' | '))
-    updateSelectInput(session,'edit_measurement',choices=c('Create new'='',opts),selected=isolate(input$edit_measurement))
+    opts <- setNames(as.character(m$measurement_id),
+                     paste(m$outcome, m$measurement_tool, sep = ' | '))
+    current <- isolate(input$edit_measurement) %||% ''
+    if (!current %in% c('', as.character(m$measurement_id))) current <- ''
+    updateSelectInput(session, 'edit_measurement',
+                      choices = c('Create new' = '', opts), selected = current)
   })
-  observeEvent(input$edit_measurement,{
+
+  observeEvent(input$new_measurement, {
+    updateSelectInput(session, 'edit_measurement', selected = '')
+    # Reset directly as well, including when Create new is already selected.
+    for (key in c('outcome', 'tool', 'domain', 'validation_url')) {
+      updateTextInput(session, key, value = '')
+    }
+    for (key in c('self_report', 'validated')) {
+      updateCheckboxInput(session, key, value = FALSE)
+    }
+    updateSelectizeInput(session, 'used_studies', choices = studies_choices(),
+                         selected = character(), server = FALSE)
+  })
+
+  observeEvent(input$edit_measurement, {
     id <- parse_id(input$edit_measurement)
-    if(is.null(id)) return()
-    m <- tables()$measurements;m <- m[as.character(m$measurement_id)==id,,drop=FALSE];req(nrow(m)==1)
-    updateTextInput(session,'outcome',value=m$outcome[1]);updateTextInput(session,'tool',value=m$measurement_tool[1] %||% '')
-    updateTextInput(session,'domain',value=m$domain[1] %||% '')
-    updateCheckboxInput(session,'self_report',value=isTRUE(m$self_reported[1]))
-    updateCheckboxInput(session,'validated',value=isTRUE(m$validated[1]))
-    updateTextInput(session,'validation_url',value=m$validation_url[1] %||% '')
-    ids <- tryCatch(unlist(jsonlite::fromJSON(as.character(m$study_ids[1]))),error=function(e) character())
-    updateSelectizeInput(session,'used_studies',selected=as.character(ids),server=TRUE)
-  },ignoreInit=TRUE)
+    if (is.null(id)) {
+      for (key in c('outcome', 'tool', 'domain', 'validation_url')) {
+        updateTextInput(session, key, value = '')
+      }
+      for (key in c('self_report', 'validated')) {
+        updateCheckboxInput(session, key, value = FALSE)
+      }
+      updateSelectizeInput(session, 'used_studies', choices = studies_choices(),
+                           selected = character(), server = FALSE)
+      return()
+    }
+
+    m <- tables()$measurements
+    m <- m[as.character(m$measurement_id) == id, , drop = FALSE]
+    if (nrow(m) != 1L) return()
+
+    text_fields <- c(outcome = 'outcome', tool = 'measurement_tool',
+                     domain = 'domain', validation_url = 'validation_url')
+    for (key in names(text_fields)) {
+      value <- m[[text_fields[[key]]]][1]
+      updateTextInput(session, key, value = if (is.na(value)) '' else as.character(value))
+    }
+    updateCheckboxInput(session, 'self_report', value = isTRUE(m$self_reported[1]))
+    updateCheckboxInput(session, 'validated', value = isTRUE(m$validated[1]))
+    ids <- intersect(measurement_study_ids(m$study_ids[1]),
+                     as.character(tables()$studies$study_id))
+    updateSelectizeInput(session, 'used_studies', choices = studies_choices(),
+                         selected = ids, server = FALSE)
+  })
+
+  # Refresh study options without clearing current selections.
+  observeEvent(tables()$studies, {
+    choices <- studies_choices()
+    selected <- isolate(input$used_studies) %||% character()
+    if (!is.null(isolate(parse_id(input$edit_measurement))) && !length(selected)) {
+      m <- tables()$measurements
+      id <- isolate(parse_id(input$edit_measurement))
+      row <- m[as.character(m$measurement_id) == id, , drop = FALSE]
+      if (nrow(row) == 1L) selected <- measurement_study_ids(row$study_ids[1])
+    }
+    updateSelectizeInput(session, 'used_studies', choices = choices,
+                         selected = intersect(as.character(selected), unname(choices)),
+                         server = FALSE)
+  })
   observeEvent(input$save_measurement,safe(function(){
     if(!nzchar(trimws(input$outcome))) stop('Outcome is required.')
     used <- unique(as.character(input$used_studies %||% character()))
@@ -186,7 +269,7 @@ server <- function(input,output,session) {
     req(input$result_study)
     m <- tables()$measurements
     keep <- vapply(seq_len(nrow(m)),function(i){
-      ids <- tryCatch(unlist(jsonlite::fromJSON(as.character(m$study_ids[i]))),error=function(e) character())
+      ids <- measurement_study_ids(m$study_ids[i])
       as.character(input$result_study) %in% as.character(ids)
     },logical(1))
     m[keep,,drop=FALSE]
