@@ -16,19 +16,18 @@ ui <- fluidPage(
 )
 
 extraction_ui <- fluidPage(
-  titlePanel('Systematic review | Neon PostgreSQL extraction'),
+  titlePanel('URA Project Data Extraction Form'),
   fluidRow(
     column(9, textOutput('current_reviewer')),
     column(3, actionButton('logout', 'Log out'))
   ),
-  p('Database-generated numeric IDs; dynamic group statistics; correlation pairs.'),
   tabsetPanel(
     tabPanel('1. Studies',
              textInput('doi_input','DOI or DOI URL'), actionButton('lookup','Fetch DOI metadata'),
              selectInput('edit_study','Edit existing study (optional)',choices=c('Create new'='')),
              textInput('title','Title'),numericInput('year','Publication year',NA),
              textInput('author','First author surname'),textInput('country','Country of data collection'),
-             selectInput('design','Study design',c('Experimental','Quasi-experimental','Cross-sectional','Cohort','Case-control','Longitudinal observational','Systematic review','Meta-analysis','Other')),
+             selectInput('design','Study design',c('Experimental','Quasi-experimental','Cross-sectional','Cohort','Case-control','Longitudinal observational','Systematic review','Meta-analysis','White paper','Internal report','Other')),
              numericInput('group_count','Number of comparison groups',2,min=1,max=12),
              uiOutput('groups_ui'),numericInput('total','Total sample',NA,min=0),
              numericInput('male','Male',NA,min=0),numericInput('female','Female',NA,min=0),
@@ -86,7 +85,7 @@ extraction_ui <- fluidPage(
 )
 
 login_ui <- fluidPage(
-  titlePanel("URA-BE-FIT Data Extraction"),
+  titlePanel("URA Project Data Extraction"),
   tabsetPanel(
     tabPanel("Login",
       textInput("login_username", "Username"),
@@ -162,14 +161,33 @@ server <- function(input,output,session) {
     }
     tryCatch({
       register_user(p, input$register_username, input$register_password)
-      showNotification("Account created. Await administrator approval.", duration = 10)
+      
+      showNotification(
+        "Account created. Await administrator approval.",
+        type = "message",
+        duration = 10
+      )
+      
       updateTextInput(session, "register_username", value = "")
       updateTextInput(session, "register_password", value = "")
       updateTextInput(session, "register_confirm", value = "")
+      
     }, error = function(e) {
-      message("Registration error: ", conditionMessage(e))
-      showNotification("Registration failed. Check username and password requirements.",
-                       type = "error", duration = 10)
+      msg <- conditionMessage(e)
+      
+      message("Registration error: ", msg)
+      
+      if (grepl("duplicate key|unique constraint", msg, ignore.case = TRUE)) {
+        msg <- "This username is already registered."
+      } else if (!grepl("^Username must|^Password must", msg)) {
+        msg <- "Registration failed. Please try again."
+      }
+      
+      showNotification(
+        msg,
+        type = "error",
+        duration = 10
+      )
     })
   })
 
